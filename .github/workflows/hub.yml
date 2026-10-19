@@ -7,8 +7,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: python3 hub.py check --local
       - run: python3 hub.py --root ex check
       - run: python3 -m unittest -q test_hub
       - run: python3 seats.py
       - run: python3 -m unittest -q test_seats
+      - if: github.event_name == 'push'
+        env:
+          ACTOR: ${{ github.actor }}
+          BEFORE: ${{ github.event.before }}
+        run: python3 seats.py --actor "$ACTOR" --since "$BEFORE"
