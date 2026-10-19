@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -76,6 +77,35 @@ class Ex(unittest.TestCase):
         self.assertEqual([a for a, _ in json.loads(out)["inbox"]],
                          ["kb/1760000500.1"])
 
+    def test_put_skew(self):
+        rc, out, err = run("--root", self.ex, "--as", "kd", "--now",
+                           "1760000100", "put",
+                           "2|_|t1|4|3|10|0|50|50|(100 kc/1760000410)|0||0")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["put"][0].split("|")[1],
+                         "1760000410.1")
+
+    def test_put_refuse(self):
+        rc, _, err = run("--root", self.ex, "--as", "kb", "--now",
+                         "1760000500", "put",
+                         "2|_|t3|2|1|2|2|0|0|(100 ka/1760000110)|0||3600")
+        self.assertEqual(rc, 0, err)
+        path = os.path.join(self.ex, "log", "kd.s2")
+        with open(path) as fh:
+            before = fh.read()
+        bad = {
+            "ERR:REF": "2|_|t3|4|1|2|2|0|0|(100 zz/1760000000)|0||0",
+            "ERR:LEASE": "2|_|t3|4|1|2|2|0|0|(100 ka/1760000110)|0||0",
+            "ERR:PROSE": "2|_|t3|4|7|3|1|0|0|(102 please help)|0||0",
+        }
+        for code, line in bad.items():
+            rc, _, err = run("--root", self.ex, "--as", "kd", "--now",
+                             "1760000600", "put", line)
+            self.assertEqual(rc, 1, code)
+            self.assertIn(code, err)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), before)
+
     def test_primer(self):
         rc, out, _ = run()
         p = json.loads(out)
@@ -99,12 +129,18 @@ class Lines(unittest.TestCase):
             "ERR:RCP": "2|1760000001|t|2|1|3|0|0|0||0||0|0000000000000000",
             "ERR:CANON": "2|1760000001|t|2|1|3|0|0|0|(103  o0000000000000000)"
                          "|0||0",
+            "ERR:PROSE": "2|1760000001|t|2|1|3|0|0|0|(21 the-whole-thing)"
+                         "|0||0",
         }
         for code, line in bad.items():
             self.assertIn(code, codes(JOIN + "\n" + line + "\n"), code)
         self.assertEqual(codes(JOIN + "\n" + JOIN + "\n"), ["ERR:ORDER"])
         self.assertEqual(codes("2|1760000001|t|2|1|3|0|0|0||0||0\n"),
                          ["ERR:JOIN"])
+
+    def test_empty_expr(self):
+        self.assertIn("ERR:BODY", codes(
+            JOIN + "\n2|1760000001|t|2|1|3|0|0|0|()|0||0\n"))
 
     def test_rcp(self):
         line = "2|1760000001|t|2|1|3|0|0|0||0||0"
@@ -136,6 +172,27 @@ class Fold(unittest.TestCase):
         self.assertEqual(sorted(f[0] for f in flags), ["ERR:AUTH", "ERR:LEASE"])
         _, items, _, _ = hub.fold(ps, 1760000200)
         self.assertEqual(items["za/1760000010"]["st"], 8)
+
+    def test_reply_before_item(self):
+        j = "2|1760000000|hub|%d|7|10|5|0|0|(102 x)|0||0"
+        ps = pkts(
+            za=[j % 1, "2|1760000100|t|1|7|1|5|0|0||1||0"],
+            zb=[j % 2, "2|1760000090|t|2|1|2|2|0|0|(100 za/1760000100)|0||0"],
+        )
+        _, items, _, flags = hub.fold(ps, 1760000200)
+        self.assertIsNone(items["za/1760000100"]["own"])
+        self.assertEqual(flags, [["ERR:ORDER", "zb/1760000090",
+                                  "za/1760000100"]])
+
+
+class Pin(unittest.TestCase):
+    def test_vendored(self):
+        with open(os.path.join(HERE, "sym2", "PIN")) as fh:
+            _, path, want = fh.read().split()
+        with open(os.path.join(HERE, "sym2", os.path.basename(path)),
+                  "rb") as fh:
+            got = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+        self.assertEqual(got, want)
 
 
 class Tree(unittest.TestCase):
@@ -175,18 +232,61 @@ class Tree(unittest.TestCase):
         rc, out, _ = run("check", cwd=d)
         self.assertEqual(rc, 1)
 
-    def test_branches(self):
-        git = lambda d, *a: subprocess.run(
-            ["git", "-C", d] + list(a), check=True, capture_output=True)
+    def git(self, d, *a):
+        return subprocess.run(["git", "-C", d] + list(a), check=True,
+                              capture_output=True, text=True).stdout
+
+    def remote(self):
         bare = os.path.join(self.tmp, "bare.git")
-        git(self.tmp, "init", "-q", "--bare", bare)
-        env = dict(os.environ, GIT_AUTHOR_NAME="z", GIT_AUTHOR_EMAIL="z@z",
-                   GIT_COMMITTER_NAME="z", GIT_COMMITTER_EMAIL="z@z")
-        os.environ.update(env)
+        self.git(self.tmp, "init", "-q", "--bare", bare)
+        os.environ.update(GIT_AUTHOR_NAME="z", GIT_AUTHOR_EMAIL="z@z",
+                          GIT_COMMITTER_NAME="z", GIT_COMMITTER_EMAIL="z@z")
+        return bare
+
+    def worker(self, name, bare):
+        d = self.clone(name)
+        self.git(d, "init", "-q", "-b", "b-" + name)
+        self.git(d, "config", "commit.gpgsign", "false")
+        self.git(d, "remote", "add", "origin", bare)
+        return d
+
+    def test_resume(self):
+        bare = self.remote()
+        d = self.worker("za", bare)
+        run("--as", "za", "join", "1", "x", cwd=d)
+        rc, out, err = run("put", "2|_|t|1|7|1|5|0|0||1||0", cwd=d)
+        self.assertEqual(rc, 0, err)
+        first = json.loads(out)["put"][0]
+        self.assertEqual(run("push", cwd=d)[0], 0)
+        d2 = self.worker("za2", bare)
+        self.assertEqual(run("sync", cwd=d2)[0], 0)
+        rc, out, err = run("--as", "za", "join", "1", "x", cwd=d2)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(json.loads(out)["resume"])
+        rc, out, err = run("put", "2|_|t|1|7|3|1|0|0||0||0", cwd=d2)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(d2, "log", "za.s2")) as fh:
+            lines = fh.read().split("\n")
+        self.assertEqual(lines[1], first)
+        self.assertEqual(run("check", cwd=d2)[0], 0)
+
+    def test_push_scope(self):
+        bare = self.remote()
+        d = self.worker("za", bare)
+        run("--as", "za", "join", "1", "x", cwd=d)
+        with open(os.path.join(d, "note"), "w") as fh:
+            fh.write("x")
+        self.git(d, "add", "note")
+        rc, _, err = run("push", cwd=d)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.git(d, "show", "--name-only", "--format=",
+                                  "HEAD").split(), ["log/za.s2"])
+        self.assertIn("A  note", self.git(d, "status", "--porcelain"))
+
+    def test_branches(self):
+        bare = self.remote()
         for name, role in (("za", "1"), ("zb", "2")):
-            d = self.clone(name)
-            git(d, "init", "-q", "-b", "b-" + name)
-            git(d, "remote", "add", "origin", bare)
+            d = self.worker(name, bare)
             rc, out, err = run("--as", name, "join", role, "x", cwd=d)
             self.assertEqual(rc, 0, err)
             rc, out, err = run("push", cwd=d)

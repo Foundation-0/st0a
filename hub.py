@@ -30,6 +30,11 @@ AGENT_ROLES = sorted(set(ROLES) - {0, OPERATOR, SWARM})
 ITEM_ACTS = {1, 6, 7, 9, 11}
 REPLY_ACTS = {2, 5, 6, 7, 12}
 TERMINAL = {4, 6, 7}
+PROSE = frozenset(
+    "the an is are was were been being please thanks thank hello this that "
+    "these those with from would should could shall have has had we you "
+    "they my our your their its very just there here what which whom whose "
+    "why how when where because about into also".split())
 
 CORE_OPS = {
     10: ["scope", "(10 target (20 ...))"],
@@ -59,7 +64,8 @@ FOLD = {
     "addr": "agent/ID",
     "order": "(ID, agent)",
     "item": "A in %s" % sorted(ITEM_ACTS),
-    "reply": "(100 addr) ; A in %s requires it" % sorted(REPLY_ACTS),
+    "reply": "(100 addr) ; A in %s requires it ; ID > addr.ID"
+             % sorted(REPLY_ACTS),
     "init": "item.st := ST or 5",
     "join": "log[0] := A=10 (102 cap+) ; role := F",
     "to": "(101 agent+) else T in {role, 7}",
@@ -158,6 +164,9 @@ def parse_line(line):
         errs.append(("CODE", "A=0"))
     if re.search(r"\( | \)|  |^ | $", body):
         errs.append(("CANON", "BODY spacing"))
+    for w in re.findall(r"[A-Za-z]+", tk + " " + body):
+        if w.lower() in PROSE:
+            errs.append(("PROSE", w))
     hub = {k: [] for k in HUB_KEYS.values()}
     if body:
         exprs, perr = parse_all(body)
@@ -166,7 +175,7 @@ def parse_line(line):
             exprs = []
         core = []
         for e in exprs:
-            if not (isinstance(e[0], str) and e[0].isdigit()):
+            if not e or not (isinstance(e[0], str) and e[0].isdigit()):
                 errs.append(("BODY", "head"))
             elif int(e[0]) in HUB_OPS:
                 herr = check_hub_op(e)
@@ -243,6 +252,8 @@ def read_sources(root, refs):
     logs, objs = [], {}
     ld, od = os.path.join(root, "log"), os.path.join(root, "obj")
     for name in sorted(os.listdir(ld)) if os.path.isdir(ld) else []:
+        if not os.path.isfile(os.path.join(ld, name)):
+            continue
         with open(os.path.join(ld, name), "rb") as fh:
             logs.append((".", name, fh.read()))
     for name in sorted(os.listdir(od)) if os.path.isdir(od) else []:
@@ -344,6 +355,9 @@ def fold(pkts, now):
             if ref not in byaddr:
                 flags.append(err("REF", p["addr"], ref))
                 continue
+            if byaddr[ref]["key"] >= p["key"]:
+                flags.append(err("ORDER", p["addr"], ref))
+                continue
             it = items.get(ref)
             if it is None:
                 continue
@@ -428,15 +442,12 @@ def views(pkts, agents, items, me):
 
 
 def self_id(root, opts):
-    if opts.get("as"):
-        return opts["as"]
-    if os.environ.get("HUB_SELF"):
-        return os.environ["HUB_SELF"]
+    me = opts.get("as") or os.environ.get("HUB_SELF")
     path = os.path.join(root, ".hub-self")
-    if os.path.exists(path):
+    if not me and os.path.exists(path):
         with open(path) as fh:
-            return fh.read().strip() or None
-    return None
+            me = fh.read().strip()
+    return me if me and AGENT.match(me) else None
 
 
 def show(it):
@@ -501,13 +512,17 @@ def primer(root, opts):
         "A": {k: v for k, v in ACTS.items() if k},
         "ST": STATES, "RQ": RQS,
         "op": {**CORE_OPS, **HUB_OPS},
+        "hubop": "top-level only",
+        "prose": sorted(PROSE),
         "agent": AGENT.pattern, "addr": ADDR.pattern, "oid": OID.pattern,
         "log": "log/<agent>.s2", "objdir": "obj/<oid>[.ext]",
         "fold": FOLD,
         "cmd": {
             "": "primer",
-            "join": "<role> <cap>+ [--as agent] ; no --as -> a<8hex>",
-            "put": "<line>+ ; ID=_ -> max(now, last+.1) ; [--rcp]",
+            "join": "<role> <cap>+ [--as agent] ; no --as -> a<8hex> ;"
+                    " known agent -> resume",
+            "put": "<line>+ ; ID=_ -> max(now, last+.1, re+.1) ;"
+                   " fold flag -> refuse ; [--rcp]",
             "state": "[--all]",
             "thread": "<addr>",
             "log": "[TK]",
@@ -527,28 +542,73 @@ def primer(root, opts):
     return out
 
 
-def write_line(root, me, line, rcp, now):
+def re_of(fields):
+    exprs, _ = parse_all(fields[9]) if len(fields) > 9 else ([], None)
+    return [a for e in exprs or [] if e and e[0] == "100" for a in e[1:]
+            if isinstance(a, str)]
+
+
+def adopt(root, me, refs):
+    path = os.path.join(root, "log", me + ".s2")
+    best = b""
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            best = fh.read()
+    cur = best
+    for _, name, data in read_sources(root, refs)[0]:
+        if name == me + ".s2" and len(data) > len(best) \
+                and data.startswith(best):
+            try:
+                _, errs = parse_log(me, data.decode("utf-8"), ".")
+            except UnicodeDecodeError:
+                continue
+            if not errs:
+                best = data
+    if best != cur:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(best)
+    return bool(best)
+
+
+def write_lines(root, me, lines, rcp, now, pkts=()):
     path = os.path.join(root, "log", me + ".s2")
     prior = ""
     if os.path.exists(path):
         with open(path) as fh:
             prior = fh.read()
-    fields = line.split("|")
-    if len(fields) >= 2 and fields[1] == "_":
-        lines = [x for x in prior.split("\n") if x]
-        last = pid_key(lines[-1].split("|")[1]) if lines else (0, 0)
-        key = (now, 0) if now > last[0] else (last[0], last[1] + 1)
-        fields[1] = pid_str(key)
-    if rcp and len(fields) == 13:
-        fields.append(rcp_sum("|".join(fields)))
-    line = "|".join(fields)
-    pkts, errs = parse_log(me, prior + line + "\n", ".")
+    keys = {p["addr"]: p["key"] for p in pkts}
+    last = max([(0, 0)] + [p["key"] for p in pkts if p["agent"] == me]
+               + [pid_key(x.split("|")[1]) for x in prior.split("\n")
+                  if x.count("|") > 1 and PID.match(x.split("|")[1])])
+    done = []
+    for line in lines:
+        fields = line.split("|")
+        if len(fields) >= 2 and fields[1] == "_":
+            floor = max([last] + [keys[r] for r in re_of(fields) if r in keys])
+            key = (now, 0) if now > floor[0] else (floor[0], floor[1] + 1)
+            fields[1] = pid_str(key)
+        if rcp and len(fields) == 13:
+            fields.append(rcp_sum("|".join(fields)))
+        done.append("|".join(fields))
+        if len(fields) >= 2 and PID.match(fields[1]):
+            last = max(last, pid_key(fields[1]))
+    mine, errs = parse_log(me, prior + "".join(x + "\n" for x in done), ".")
     if errs:
         return None, errs
+    new = mine[len(mine) - len(done):]
+    if pkts:
+        addrs = {p["addr"] for p in new}
+        allp = sorted([p for p in pkts if p["addr"] not in addrs] + new,
+                      key=lambda p: (p["key"], p["agent"]))
+        _, _, _, flags = fold(allp, now)
+        errs = [f for f in flags if f[1] in addrs]
+        if errs:
+            return None, errs
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a") as fh:
-        fh.write(line + "\n")
-    return line, []
+        fh.write("".join(x + "\n" for x in done))
+    return done, []
 
 
 def cmd_join(root, opts, args):
@@ -556,19 +616,19 @@ def cmd_join(root, opts, args):
             or len(args) < 2:
         return fail(2, ["usage", "join <role> <cap>+"])
     me = self_id(root, opts) or "a" + os.urandom(4).hex()
-    if not AGENT.match(me):
-        return fail(2, ["agent", AGENT.pattern])
-    if os.path.exists(os.path.join(root, "log", me + ".s2")):
-        return fail(1, err("JOIN", me, "exists"))
-    line, errs = write_line(
-        root, me, "2|_|hub|%s|7|10|5|100|100|(102 %s)|0||0"
-        % (args[0], " ".join(args[1:])), False, opts["now"])
-    if errs:
-        return fail(1, *errs)
+    resume = adopt(root, me, opts["refs"])
+    if not resume:
+        done, errs = write_lines(
+            root, me, ["2|_|hub|%s|7|10|5|100|100|(102 %s)|0||0"
+                       % (args[0], " ".join(args[1:]))], False, opts["now"])
+        if errs:
+            return fail(1, *errs)
     with open(os.path.join(root, ".hub-self"), "w") as fh:
         fh.write(me + "\n")
-    emit({"self": me, "line": line, "next": ["python3 hub.py push",
-                                             "python3 hub.py state"]})
+    out = {"self": me}
+    out.update({"resume": True} if resume else {"line": done[0]})
+    out["next"] = ["python3 hub.py push", "python3 hub.py state"]
+    emit(out)
     return 0
 
 
@@ -576,15 +636,16 @@ def cmd_put(root, opts, args):
     me = self_id(root, opts)
     if not me:
         return fail(2, ["self", "join"])
-    if not os.path.exists(os.path.join(root, "log", me + ".s2")):
+    if not args:
+        return fail(2, ["usage", "put <line>+"])
+    if not adopt(root, me, opts["refs"]):
         return fail(1, err("JOIN", me, "missing"))
-    out = []
-    for line in args:
-        done, errs = write_line(root, me, line, opts.get("rcp"), opts["now"])
-        if errs:
-            return fail(1, *errs)
-        out.append(done)
-    emit({"put": out})
+    pkts, _, _ = load(root, opts["refs"])
+    done, errs = write_lines(root, me, args, opts.get("rcp"), opts["now"],
+                             pkts)
+    if errs:
+        return fail(1, *errs)
+    emit({"put": done})
     return 0
 
 
@@ -678,17 +739,18 @@ def cmd_push(root, opts, args):
     diff = (git(root, "diff", "--cached", "--unified=0", "--", "log") or b"")
     added = [x[1:] for x in diff.decode().splitlines()
              if x.startswith("+") and not x.startswith("+++")]
-    staged = git(root, "diff", "--cached", "--name-only") or b""
-    if staged.strip():
+    staged = git(root, "diff", "--cached", "--name-only", "--", *dirs) or b""
+    if dirs and staged.strip():
         msg = "\n".join(added) or "obj"
-        if git(root, "commit", "-q", "-m", msg) is None:
+        if git(root, "commit", "-q", "-m", msg, "--", *dirs) is None:
             return fail(2, ["git", "commit"])
     branch = (git(root, "rev-parse", "--abbrev-ref", "HEAD") or b"").strip()
     if not branch:
         return fail(2, ["git", "branch"])
     branch = branch.decode()
     if git(root, "ls-remote", "--exit-code", "--heads", "origin", branch):
-        if git(root, "pull", "-q", "--rebase", "origin", branch) is None:
+        if git(root, "pull", "-q", "--rebase", "--autostash", "origin",
+               branch) is None:
             return fail(2, ["git", "pull --rebase"])
     for delay in (0, 2, 4, 8, 16):
         time.sleep(delay)
