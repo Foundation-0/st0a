@@ -12,6 +12,17 @@ sys.path.insert(0, HERE)
 import hub  # noqa: E402
 
 JOIN = "2|1760000000|hub|2|7|10|5|100|100|(102 code)|0||0"
+CARD = """---
+agent: %s
+person: A Person
+github: %s
+account: a-person-bot
+model: Claude, by Anthropic
+harness: Claude Code
+since: 2026-10-19
+---
+Builds and checks things.
+"""
 
 
 def run(*args, cwd=HERE, env=None):
@@ -112,6 +123,9 @@ class Ex(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(6, p["F"] + p["T"])
         self.assertTrue(p["next"])
+        self.assertEqual(p["limit"], {"lease/person": hub.LEASE_CAP,
+                                      "pkt/agent/day": hub.DAY_CAP,
+                                      "obj.bytes": hub.OBJ_MAX})
 
 
 class Lines(unittest.TestCase):
@@ -184,6 +198,48 @@ class Fold(unittest.TestCase):
         self.assertEqual(flags, [["ERR:ORDER", "zb/1760000090",
                                   "za/1760000100"]])
 
+    def test_lease_cap(self):
+        j = "2|1760000000|hub|%d|7|10|5|0|0|(102 x)|0||0"
+        c = "2|%d|t|2|1|2|2|0|0|(100 za/17600000%d0)|0||%d"
+        logs = dict(
+            za=[j % 1] + ["2|17600000%d0|t|1|7|1|5|0|0||1||0" % i
+                          for i in range(1, 7)],
+            zb=[j % 2, c % (1760000100, 1, 0), c % (1760000110, 2, 50),
+                c % (1760000210, 1, 0)],
+            zc=[j % 2, c % (1760000120, 3, 0), c % (1760000130, 4, 0),
+                c % (1760000200, 5, 0)],
+            zd=[j % 2, c % (1760000140, 6, 0)],
+        )
+        _, _, _, flags = hub.fold(pkts(**logs), 1760000300)
+        self.assertEqual(flags, [])
+        ps = pkts(**logs)
+        who = {"za": "o", "zb": "p", "zc": "p", "zd": "q"}
+        for p in ps:
+            p["person"] = who[p["agent"]]
+        agents, items, _, flags = hub.fold(ps, 1760000300)
+        self.assertEqual(flags, [["ERR:CAP", "zc/1760000130",
+                                  "za/1760000040"]])
+        self.assertIsNone(items["za/1760000040"]["own"])
+        self.assertEqual(items["za/1760000050"]["own"], "zc")
+        self.assertEqual(items["za/1760000060"]["own"], "zd")
+        self.assertEqual(agents["zc"]["person"], "p")
+
+    def test_day_cap(self):
+        line = "2|%d|t|1|7|1|5|0|0||1||0"
+        log = ["2|1760000000|hub|1|7|10|5|0|0|(102 x)|0||0"] + [
+            line % (1760000001 + i) for i in range(hub.DAY_CAP + 1)] + [
+            line % 1760054400]
+        _, items, _, flags = hub.fold(pkts(za=log), 1760054400)
+        self.assertEqual((len(items), flags), (hub.DAY_CAP + 2, []))
+        ps = pkts(za=log)
+        for p in ps:
+            p["person"] = "p"
+        agents, items, _, flags = hub.fold(ps, 1760054400)
+        self.assertEqual(flags, [["ERR:CAP", "za/1760000200", "day"],
+                                 ["ERR:CAP", "za/1760000201", "day"]])
+        self.assertEqual(len(items), hub.DAY_CAP)
+        self.assertEqual(agents["za"]["last"], "za/1760054400")
+
 
 class Pin(unittest.TestCase):
     def test_vendored(self):
@@ -205,7 +261,7 @@ class Tree(unittest.TestCase):
     def clone(self, name):
         d = os.path.join(self.tmp, name)
         shutil.copytree(HERE, d, ignore=shutil.ignore_patterns(
-            ".git", "log", "obj", ".hub-self", "__pycache__"))
+            ".git", "log", "obj", "agents", ".hub-self", "__pycache__"))
         return d
 
     def test_join_put_obj(self):
@@ -231,6 +287,77 @@ class Tree(unittest.TestCase):
             fh.write(b"y")
         rc, out, _ = run("check", cwd=d)
         self.assertEqual(rc, 1)
+
+    def seat(self, d, *ids):
+        os.makedirs(os.path.join(d, "agents"), exist_ok=True)
+        with open(os.path.join(d, "agents", "README.md"), "w") as fh:
+            fh.write("# Seats\n")
+        for aid in ids:
+            with open(os.path.join(d, "agents", aid + ".md"), "w") as fh:
+                fh.write(CARD % (aid, "A-Person"))
+
+    def test_seats(self):
+        d = self.clone("w")
+        self.seat(d, "zz")
+        line = "2|_|t|2|7|3|1|50|50||0||0"
+        for args in (["--as", "zy"], []):
+            rc, _, err = run(*args + ["join", "2", "code"], cwd=d)
+            self.assertEqual(rc, 1)
+            self.assertIn("ERR:SEAT", err)
+        self.assertFalse(os.path.exists(os.path.join(d, "log")))
+        rc, _, err = run("--as", "zz", "join", "2", "code", cwd=d)
+        self.assertEqual(rc, 0, err)
+        rc, _, err = run("put", line, cwd=d)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(d, "log", "zy.s2"), "w") as fh:
+            fh.write(JOIN + "\n")
+        rc, _, err = run("--as", "zy", "put", line, cwd=d)
+        self.assertEqual(rc, 1)
+        self.assertIn("ERR:SEAT", err)
+        ps, _, flags = hub.load(d, False)
+        self.assertEqual(flags, [["ERR:SEAT", "zy", "no card"]])
+        self.assertEqual({(p["agent"], p["person"]) for p in ps},
+                         {("zz", "a-person")})
+        rc, out, _ = run("state", cwd=d)
+        self.assertEqual(json.loads(out)["agents"]["zz"]["person"], "a-person")
+        self.assertEqual(sorted(json.loads(out)["agents"]), ["zz"])
+
+    def test_day_cap_put(self):
+        d = self.clone("w")
+        self.seat(d, "zz")
+        rc, _, err = run("--as", "zz", "--now", "1760000000", "join", "2",
+                         "code", cwd=d)
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(d, "log", "zz.s2"), "a") as fh:
+            fh.write("".join("2|%d|t|2|7|3|1|50|50||0||0\n" % (1760000001 + i)
+                             for i in range(hub.DAY_CAP - 1)))
+        line = "2|_|t|2|7|3|1|50|50||0||0"
+        rc, _, err = run("--now", "1760000300", "put", line, cwd=d)
+        self.assertEqual(rc, 1)
+        self.assertIn("ERR:CAP", err)
+        rc, _, err = run("--now", "1760054400", "put", line, cwd=d)
+        self.assertEqual(rc, 0, err)
+
+    def test_obj_size(self):
+        d = self.clone("w")
+        src = os.path.join(self.tmp, "big.bin")
+        with open(src, "wb") as fh:
+            fh.write(b"x" * (hub.OBJ_MAX + 1))
+        rc, _, err = run("obj", src, cwd=d)
+        self.assertEqual(rc, 1)
+        self.assertIn("ERR:SIZE", err)
+        self.assertFalse(os.path.exists(os.path.join(d, "obj")))
+        with open(src, "wb") as fh:
+            fh.write(b"x" * hub.OBJ_MAX)
+        rc, _, err = run("obj", src, cwd=d)
+        self.assertEqual(rc, 0, err)
+        big = b"y" * (hub.OBJ_MAX + 1)
+        with open(os.path.join(d, "obj", hub.oid_of(big)), "wb") as fh:
+            fh.write(big)
+        rc, out, _ = run("check", cwd=d)
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out)["flags"],
+                         [["ERR:SIZE", ".", hub.oid_of(big)]])
 
     def git(self, d, *a):
         return subprocess.run(["git", "-C", d] + list(a), check=True,
@@ -297,6 +424,35 @@ class Tree(unittest.TestCase):
         self.assertEqual(sorted(json.loads(out)["agents"]), ["za", "zb"])
         rc, out, _ = run("check", cwd=d)
         self.assertEqual(rc, 0, out)
+
+    def test_revoke(self):
+        bare = self.remote()
+        m = self.worker("m", bare)
+        self.seat(m, "za")
+        self.git(m, "add", "agents")
+        self.git(m, "commit", "-q", "-m", "seat")
+        self.git(m, "push", "-q", "origin", "HEAD:main")
+        d = self.worker("za", bare)
+        self.seat(d, "zb")
+        self.assertEqual(run("sync", cwd=d)[0], 0)
+        rc, _, err = run("--as", "zb", "join", "2", "x", cwd=d)
+        self.assertIn("ERR:SEAT", err)
+        rc, _, err = run("--as", "za", "join", "1", "x", cwd=d)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(run("push", cwd=d)[0], 0)
+        rc, out, _ = run("state", cwd=d)
+        self.assertEqual(json.loads(out)["agents"]["za"]["person"], "a-person")
+        self.git(m, "rm", "-q", "agents/za.md")
+        self.git(m, "commit", "-q", "-m", "unseat")
+        self.git(m, "push", "-q", "origin", "HEAD:main")
+        self.assertEqual(run("sync", cwd=d)[0], 0)
+        rc, out, _ = run("state", cwd=d)
+        s = json.loads(out)
+        self.assertEqual(s["agents"], {})
+        self.assertEqual(s["flags"], [["ERR:SEAT", "za", "no card"]])
+        rc, _, err = run("put", "2|_|t|1|7|3|1|0|0||0||0", cwd=d)
+        self.assertEqual(rc, 1)
+        self.assertIn("ERR:SEAT", err)
 
 
 if __name__ == "__main__":
