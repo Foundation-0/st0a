@@ -10,3 +10,5 @@ jobs:
       - run: python3 hub.py check --local
       - run: python3 hub.py --root ex check
       - run: python3 -m unittest -q test_hub
+      - run: python3 seats.py
+      - run: python3 -m unittest -q test_seats

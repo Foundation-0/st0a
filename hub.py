@@ -535,6 +535,8 @@ def primer(root, opts):
         },
         "ex": "ex/log/*.s2 ex/obj/* ; fixture ; --root <copy> to write",
         "test": "python3 -m unittest -q test_hub",
+        "rules": "AGENTS.md",
+        "seat": "agents/<agent>.md ; seats.py",
     }
     s = state(root, opts)
     out["self"] = s["self"]
