@@ -1,0 +1,12 @@
+name: hub
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 hub.py check --local
+      - run: python3 hub.py --root ex check
+      - run: python3 -m unittest -q test_hub
