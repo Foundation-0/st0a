@@ -13,6 +13,8 @@ from sym2_parse import (  # noqa: E402
     ACTS, BASE, ROLES, RQS, STATES, SUM, TOKEN, check_expr, check_scope,
     parse_all, rcp_sum, split_fields,
 )
+sys.path.insert(0, HERE)
+import seats  # noqa: E402
 
 PROFILE = "st0a/1"
 WIRE = "sym2p/2"
@@ -24,6 +26,9 @@ ADDR = re.compile(r"^([a-z][a-z0-9-]{0,31})/([0-9]{10}(?:\.[1-9][0-9]*)?)$")
 OID = re.compile(r"^o[0-9a-f]{16}$")
 OFILE = re.compile(r"^(o[0-9a-f]{16})(\.[a-z0-9]{1,8})?$")
 LOGFILE = re.compile(r"^([a-z][a-z0-9-]{0,31})\.s2$")
+
+MAIN = "refs/remotes/origin/main"
+LEASE_CAP, DAY_CAP, OBJ_MAX = 3, 200, 1 << 20
 
 OPERATOR, SWARM = 6, 7
 AGENT_ROLES = sorted(set(ROLES) - {0, OPERATOR, SWARM})
@@ -86,8 +91,13 @@ FOLD = {
     "watch": "item and me in {by, own} and last(me) < last(other)",
     "lex": "first (104 sym oid) wins",
     "src": "worktree + refs/remotes/origin/*",
+    "seat": "agents/<agent>.md on origin/main else worktree ; no agents/ ->"
+            " off ; no card -> drop log, SEAT ; person := github",
+    "cap": "seats on -> st=2 while person holds %d live st=2 -> CAP, not"
+           " applied ; pkt %d+ of agent in ID//86400 -> CAP, dropped"
+           % (LEASE_CAP, DAY_CAP + 1),
     "verify": "cat obj(receipt)+ obj(item)+ | prog ; exit == ok -> ST=4 else ST=3",
-    "fn": "hub.py:parse_line,parse_log,fold,transition,views",
+    "fn": "hub.py:seated,parse_line,parse_log,fold,transition,views",
     "oid": "o + sha256(bytes)[:16]",
 }
 
@@ -274,25 +284,59 @@ def read_sources(root, refs):
                 objs.setdefault(name, (ref, sha))
             elif "/" not in name:
                 blobs.append((ref, name, sha))
-    if blobs:
-        batch = git(root, "cat-file", "--batch",
-                    data="".join(b[2] + "\n" for b in blobs).encode()) or b""
-        pos = 0
-        for ref, name, sha in blobs:
-            head_end = batch.index(b"\n", pos)
-            size = int(batch[pos:head_end].split()[2])
-            logs.append((ref, name, batch[head_end + 1:head_end + 1 + size]))
-            pos = head_end + 1 + size + 1
+    for (ref, name, _), data in zip(blobs, cat(root, [b[2] for b in blobs])):
+        logs.append((ref, name, data))
     return logs, objs
+
+
+def cat(root, shas):
+    if not shas:
+        return []
+    batch = git(root, "cat-file", "--batch",
+                data="".join(s + "\n" for s in shas).encode()) or b""
+    out, pos = [], 0
+    for _ in shas:
+        head_end = batch.index(b"\n", pos)
+        size = int(batch[pos:head_end].split()[2])
+        out.append(batch[head_end + 1:head_end + 1 + size])
+        pos = head_end + 1 + size + 1
+    return out
+
+
+def seated(root, refs):
+    tree = git(root, "ls-tree", MAIN, "--", "agents/") if refs else None
+    if tree is not None:
+        if not tree.strip():
+            return None
+        rows = [r.split(None, 3) for r in tree.decode().splitlines()]
+        rows = [(r[3][7:], r[2]) for r in rows if r[1] == "blob"]
+        heads = [(n, seats.parse(d.decode("utf-8", "replace"))[0]) for n, d
+                 in zip([n for n, _ in rows], cat(root, [s for _, s in rows]))]
+    else:
+        adir = os.path.join(root, "agents")
+        if not os.path.isdir(adir):
+            return None
+        heads = [(n, seats.card(os.path.join(adir, n))[0])
+                 for n in sorted(os.listdir(adir))
+                 if os.path.isfile(os.path.join(adir, n))]
+    return {n[:-3]: h["github"].lower() for n, h in heads
+            if n.endswith(".md") and n != "README.md" and h
+            and h.get("agent") == n[:-3] and h.get("github")}
 
 
 def load(root, refs):
     logs, objs = read_sources(root, refs)
-    flags, seen, bad = [], {}, set()
+    seat = seated(root, refs)
+    flags, seen, bad, gone = [], {}, set(), set()
     for where, name, data in logs:
         m = LOGFILE.match(name)
         if not m:
             flags.append(err("PATH", where, "log/" + name))
+            continue
+        if seat is not None and m.group(1) not in seat:
+            if m.group(1) not in gone:
+                gone.add(m.group(1))
+                flags.append(err("SEAT", m.group(1), "no card"))
             continue
         try:
             text = data.decode("utf-8")
@@ -302,6 +346,8 @@ def load(root, refs):
         pkts, errs = parse_log(m.group(1), text, where)
         flags.extend(errs)
         for p in pkts:
+            if seat is not None:
+                p["person"] = seat[p["agent"]]
             prior = seen.get(p["addr"])
             if prior is None:
                 seen[p["addr"]] = p
@@ -339,12 +385,20 @@ def oid_of(data):
 
 
 def fold(pkts, now):
-    agents, items, flags, lex = {}, {}, [], {}
+    agents, items, flags, lex, days = {}, {}, [], {}, {}
     byaddr = {p["addr"]: p for p in pkts}
     for p in pkts:
         me, t = p["agent"], p["key"][0]
+        if p.get("person"):
+            day = (me, t // 86400)
+            days[day] = days.get(day, 0) + 1
+            if days[day] > DAY_CAP:
+                flags.append(err("CAP", p["addr"], "day"))
+                continue
         if me not in agents:
             agents[me] = {"role": p["f"], "cap": p["cap"], "join": p["addr"]}
+            if p.get("person"):
+                agents[me]["person"] = p["person"]
         agents[me]["last"] = p["addr"]
         for sym, oid in p["def"]:
             if sym not in lex:
@@ -365,7 +419,7 @@ def fold(pkts, now):
             it["last"] = p["key"]
             it["lastby"] = me
             it["obj"] = sorted(set(it["obj"]) | set(p["obj"]))
-            transition(it, p, me, t, flags)
+            transition(it, p, me, t, flags, agents, items)
         if p["a"] in ITEM_ACTS:
             items[p["addr"]] = {
                 "addr": p["addr"], "a": p["a"], "tk": p["tk"], "by": me,
@@ -378,7 +432,13 @@ def fold(pkts, now):
     return agents, items, lex, flags
 
 
-def transition(it, p, me, t, flags):
+def held(agents, items, person, t, skip):
+    return sum(1 for it in items.values() if it is not skip and it["st"] == 2
+               and agents.get(it["own"], {}).get("person") == person
+               and (it["until"] is None or it["until"] >= t))
+
+
+def transition(it, p, me, t, flags, agents, items):
     st, by, own = p["st"], it["by"], it["own"]
     if not st:
         return
@@ -389,6 +449,10 @@ def transition(it, p, me, t, flags):
         live = own is not None and (it["until"] is None or it["until"] >= t)
         if live and own != me:
             flags.append(err("LEASE", p["addr"], it["addr"]))
+            return
+        if p.get("person") and held(agents, items, p["person"], t,
+                                    it) >= LEASE_CAP:
+            flags.append(err("CAP", p["addr"], it["addr"]))
             return
         it["own"] = me
         it["until"] = t + p["exp"] if p["exp"] else None
@@ -470,7 +534,9 @@ def state(root, opts):
              if opts.get("all") or it["st"] not in TERMINAL]
     out["items"] = shown
     if me in agents:
-        inbox, watch = views(pkts, agents, items, me)
+        gone = {f[1] for f in fflags if f[0] == "ERR:CAP" and f[2] == "day"}
+        inbox, watch = views([p for p in pkts if p["addr"] not in gone],
+                             agents, items, me)
         out["inbox"] = [[a, byaddr[a]["raw"]] for a in inbox]
         out["watch"] = watch
     out["lex"] = lex
@@ -526,7 +592,8 @@ def primer(root, opts):
             "state": "[--all]",
             "thread": "<addr>",
             "log": "[TK]",
-            "obj": "<file|-> [.ext]",
+            "obj": "<file|-> [.ext] ; size > %d -> SIZE ; bigger -> project"
+                   " repo + manifest obj (url sha256)" % OBJ_MAX,
             "get": "<oid>",
             "check": "",
             "sync": "",
@@ -536,7 +603,9 @@ def primer(root, opts):
         "ex": "ex/log/*.s2 ex/obj/* ; fixture ; --root <copy> to write",
         "test": "python3 -m unittest -q test_hub",
         "rules": "AGENTS.md",
-        "seat": "agents/<agent>.md ; seats.py",
+        "seat": "agents/<agent>.md ; seats.py ; no seat -> join, put refuse",
+        "limit": {"lease/person": LEASE_CAP, "pkt/agent/day": DAY_CAP,
+                  "obj.bytes": OBJ_MAX},
     }
     s = state(root, opts)
     out["self"] = s["self"]
@@ -573,7 +642,7 @@ def adopt(root, me, refs):
     return bool(best)
 
 
-def write_lines(root, me, lines, rcp, now, pkts=()):
+def write_lines(root, me, lines, rcp, now, pkts=(), person=None):
     path = os.path.join(root, "log", me + ".s2")
     prior = ""
     if os.path.exists(path):
@@ -598,7 +667,8 @@ def write_lines(root, me, lines, rcp, now, pkts=()):
     mine, errs = parse_log(me, prior + "".join(x + "\n" for x in done), ".")
     if errs:
         return None, errs
-    new = mine[len(mine) - len(done):]
+    new = [dict(p, person=person) if person else p
+           for p in mine[len(mine) - len(done):]]
     if pkts:
         addrs = {p["addr"] for p in new}
         allp = sorted([p for p in pkts if p["addr"] not in addrs] + new,
@@ -618,6 +688,9 @@ def cmd_join(root, opts, args):
             or len(args) < 2:
         return fail(2, ["usage", "join <role> <cap>+"])
     me = self_id(root, opts) or "a" + os.urandom(4).hex()
+    seat = seated(root, opts["refs"])
+    if seat is not None and me not in seat:
+        return fail(1, err("SEAT", me, "no card"))
     resume = adopt(root, me, opts["refs"])
     if not resume:
         done, errs = write_lines(
@@ -640,11 +713,14 @@ def cmd_put(root, opts, args):
         return fail(2, ["self", "join"])
     if not args:
         return fail(2, ["usage", "put <line>+"])
+    seat = seated(root, opts["refs"])
+    if seat is not None and me not in seat:
+        return fail(1, err("SEAT", me, "no card"))
     if not adopt(root, me, opts["refs"]):
         return fail(1, err("JOIN", me, "missing"))
     pkts, _, _ = load(root, opts["refs"])
     done, errs = write_lines(root, me, args, opts.get("rcp"), opts["now"],
-                             pkts)
+                             pkts, (seat or {}).get(me))
     if errs:
         return fail(1, *errs)
     emit({"put": done})
@@ -677,10 +753,13 @@ def cmd_obj(root, opts, args):
     if len(args) not in (1, 2):
         return fail(2, ["usage", "obj <file|-> [.ext]"])
     if args[0] == "-":
-        data = sys.stdin.buffer.read()
+        data = sys.stdin.buffer.read(OBJ_MAX + 1)
     else:
         with open(args[0], "rb") as fh:
-            data = fh.read()
+            data = fh.read(OBJ_MAX + 1)
+    if len(data) > OBJ_MAX:
+        return fail(1, err("SIZE", args[0], "max %d ; bigger -> project repo"
+                           " + manifest obj (url sha256)" % OBJ_MAX))
     oid = oid_of(data)
     ext = (args[1] if len(args) == 2 else os.path.splitext(args[0])[1]).lower()
     name = oid + (ext if re.fullmatch(r"\.[a-z0-9]{1,8}", ext) else "")
@@ -715,6 +794,8 @@ def cmd_check(root, opts, args):
         data = obj_bytes(root, entry)
         if data is None or oid_of(data) != oid:
             flags.append(err("OBJ", entry[1], oid))
+        elif len(data) > OBJ_MAX:
+            flags.append(err("SIZE", entry[1], oid))
     for p in pkts:
         for oid in p["obj"] + [d[1] for d in p["def"]]:
             if oid not in idx:
